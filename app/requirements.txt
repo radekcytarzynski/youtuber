@@ -1,0 +1,6 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+argon2-cffi==23.1.0
+# Bez przypiętej wersji: każdy rebuild obrazu pobiera najnowszy yt-dlp.
+yt-dlp[default]

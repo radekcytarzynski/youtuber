@@ -1,0 +1,27 @@
+{$DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Content-Security-Policy "default-src 'self'; img-src 'self'; media-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+		-Server
+	}
+
+	request_body {
+		max_size 16KB
+	}
+
+	reverse_proxy app:8000 {
+		# Natychmiastowe przekazywanie danych audio, bez buforowania.
+		flush_interval -1
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

@@ -1,0 +1,57 @@
+name: yt-proxy
+
+services:
+  caddy:
+    image: caddy:2.8.4
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - ytproxy
+    depends_on:
+      - app
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+  app:
+    build: ./app
+    restart: unless-stopped
+    env_file: .env
+    # Brak sekcji "ports": aplikacja jest dostępna wyłącznie przez Caddy.
+    volumes:
+      - appdata:/data
+    networks:
+      - ytproxy
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 200
+
+networks:
+  ytproxy:
+    # Stała podsieć, żeby aplikacja wiedziała, której sieci ufać (TRUSTED_PROXY_NETS).
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
+
+volumes:
+  caddy_data:
+  caddy_config:
+  appdata:
