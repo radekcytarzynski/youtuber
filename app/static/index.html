@@ -26,10 +26,24 @@
         <input type="search" id="search-input" placeholder="Szukaj, wpisz @kanał albo wklej link" required maxlength="200" aria-label="Szukaj">
         <button type="submit">Szukaj</button>
       </form>
+      <select id="quality" class="quality" aria-label="Jakość odtwarzania" title="Jakość odtwarzania">
+        <option value="audio">Audio</option>
+        <option value="360">360p</option>
+        <option value="720">720p</option>
+        <option value="1080">1080p</option>
+      </select>
       <button type="button" id="logout-btn" class="ghost">Wyloguj</button>
     </header>
 
     <main class="content">
+      <section id="video-panel" class="video-panel" hidden>
+        <video id="video" controls playsinline preload="none"></video>
+        <div id="seek-row" class="seek-row" hidden>
+          <input type="range" id="seek" min="0" max="0" step="1" value="0" aria-label="Pozycja w filmie">
+          <span id="seek-time" class="seek-time"></span>
+        </div>
+      </section>
+
       <section id="favorites" class="favorites" hidden>
         <h2 class="list-title">Ulubione kanały</h2>
         <ul id="favorites-list" class="fav-list"></ul>

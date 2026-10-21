@@ -1,8 +1,10 @@
-"""Dostęp do YouTube przez yt-dlp: wyszukiwanie, kanały, miniatury i strumień audio."""
+"""Dostęp do YouTube przez yt-dlp: wyszukiwanie, kanały, miniatury, strumień audio i wideo."""
 
 import asyncio
 import logging
 import re
+import secrets
+import shutil
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -23,8 +25,34 @@ UPSTREAM_CHUNK = 10 * 1024 * 1024
 READ_SIZE = 64 * 1024
 THUMB_KEEP = 5000
 
-MIME_TYPES = {"m4a": "audio/mp4", "mp4": "audio/mp4", "webm": "audio/webm", "opus": "audio/ogg"}
+AUDIO_MIME = {"m4a": "audio/mp4", "mp4": "audio/mp4", "webm": "audio/webm", "opus": "audio/ogg"}
+VIDEO_MIME = {"mp4": "video/mp4", "webm": "video/webm"}
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _merged_format(height: int) -> str:
+    video = f"bestvideo[height<={height}][protocol=https]"
+    m4a = "bestaudio[ext=m4a][protocol=https]"
+    # Najpierw H.264 (odtworzy go każda przeglądarka), potem dowolny kodek obrazu.
+    return f"{video}[vcodec^=avc1]+{m4a}/{video}+{m4a}/{video}+bestaudio[protocol=https]"
+
+
+# "audio" to pojedynczy plik (przewijanie przez nagłówek Range). Wideo to osobne
+# strumienie obrazu i dźwięku łączone w locie przez ffmpeg; YouTube nie udostępnia
+# już plików z obrazem i dźwiękiem razem (format 18).
+FORMATS = {
+    "audio": "bestaudio[ext=m4a][protocol=https]/bestaudio[protocol=https]",
+    "360": _merged_format(360),
+    "720": _merged_format(720),
+    "1080": _merged_format(1080),
+}
+MERGED = ("360", "720", "1080")
+
+# ffmpeg pobiera strumienie przez tę samą aplikację (endpoint /internal), żeby
+# korzystać z pobierania w kawałkach i odświeżania wygasłych linków.
+INTERNAL_BASE = "http://127.0.0.1:8000"
+INTERNAL_SECRET = secrets.token_urlsafe(24)
+MAX_FFMPEG = 3
 
 
 class YouTubeError(Exception):
@@ -65,8 +93,9 @@ _ytdlp_cache_dir: Path | None = None
 # yt-dlp jest synchroniczny i dość ciężki; ograniczamy liczbę równoczesnych wywołań.
 _ytdlp_slots = asyncio.Semaphore(3)
 _inflight: dict[str, asyncio.Future] = {}
+_ffmpeg_running = 0
 
-_audio_cache = _TTLCache(ttl=3600, maxsize=300)
+_stream_cache = _TTLCache(ttl=3600, maxsize=300)
 _search_cache = _TTLCache(ttl=600, maxsize=200)
 _channel_cache = _TTLCache(ttl=600, maxsize=200)
 
@@ -235,24 +264,29 @@ def _url_param(url: str, name: str) -> int | None:
     return int(value) if value and value.isdigit() else None
 
 
-def _audio_sync(video_id: str) -> dict:
-    opts = {**_base_opts(), "format": "bestaudio[ext=m4a][protocol=https]/bestaudio[protocol=https]"}
+def _stream_info(fmt: dict) -> dict:
+    url = fmt.get("url")
+    if not url:
+        raise YouTubeError("Nie znaleziono strumienia dla tego filmu.")
+    return {
+        "url": url,
+        "headers": dict(fmt.get("http_headers") or {}),
+        "ext": fmt.get("ext"),
+        "filesize": fmt.get("filesize") or _url_param(url, "clen"),
+        "expire": _url_param(url, "expire"),
+    }
+
+
+def _streams_sync(video_id: str, quality: str) -> dict:
+    opts = {**_base_opts(), "format": FORMATS[quality]}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(WATCH_URL + video_id, download=False)
 
     if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
         raise YouTubeError("Transmisje na żywo i zaplanowane premiery nie są obsługiwane.")
-    url = info.get("url")
-    if not url:
-        raise YouTubeError("Nie znaleziono strumienia audio dla tego filmu.")
-    return {
-        "url": url,
-        "headers": dict(info.get("http_headers") or {}),
-        "ext": info.get("ext"),
-        "filesize": info.get("filesize") or _url_param(url, "clen"),
-        "expire": _url_param(url, "expire"),
-        "entry": _entry(info),
-    }
+    # Przy łączonych formatach (obraz+dźwięk) yt-dlp zwraca je w requested_formats.
+    formats = info.get("requested_formats") or [info]
+    return {"streams": [_stream_info(fmt) for fmt in formats], "entry": _entry(info)}
 
 
 # --- operacje dla API -----------------------------------------------------------
@@ -263,8 +297,8 @@ async def search(query: str, limit: int) -> dict:
     if target and target[0] == "channel":
         return {"channel": target[1]}
     if target and target[0] == "video":
-        audio = await get_audio(target[1])
-        return {"items": [audio["entry"]]}
+        data = await get_streams(target[1], "audio")
+        return {"items": [data["entry"]]}
 
     key = f"{limit}:{query.lower()}"
     items = _search_cache.get(key)
@@ -285,25 +319,34 @@ async def channel(channel_id: str, page: int, size: int) -> dict:
     return result
 
 
-async def get_audio(video_id: str, refresh: bool = False) -> dict:
+def check_quality(quality: str) -> None:
+    if quality not in FORMATS:
+        raise InvalidInput("Nieprawidłowa jakość.")
+
+
+async def get_streams(video_id: str, quality: str, refresh: bool = False) -> dict:
+    """Linki googlevideo dla jakości: {"streams": [...], "entry": {...}}."""
     check_video_id(video_id)
+    check_quality(quality)
+    key = f"{quality}:{video_id}"
     if refresh:
-        _audio_cache.pop(video_id)
+        _stream_cache.pop(key)
     else:
-        cached = _audio_cache.get(video_id)
+        cached = _stream_cache.get(key)
         if cached:
             return cached
 
     async def load():
-        audio = await _run(_audio_sync, video_id)
+        data = await _run(_streams_sync, video_id, quality)
         ttl = 3600
-        if audio["expire"]:
+        expires = [s["expire"] for s in data["streams"] if s["expire"]]
+        if expires:
             # Link googlevideo wygasa; odświeżamy go z zapasem.
-            ttl = max(60, min(ttl, audio["expire"] - time.time() - 600))
-        _audio_cache.set(video_id, audio, ttl)
-        return audio
+            ttl = max(60, min(ttl, min(expires) - time.time() - 600))
+        _stream_cache.set(key, data, ttl)
+        return data
 
-    return await _dedupe("audio:" + video_id, load)
+    return await _dedupe("streams:" + key, load)
 
 
 # --- miniatury ------------------------------------------------------------------
@@ -325,7 +368,7 @@ async def thumbnail(video_id: str) -> FileResponse:
     return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=604800"})
 
 
-# --- strumień audio -------------------------------------------------------------
+# --- strumień z googlevideo -----------------------------------------------------
 
 
 class _RangeNotSatisfiable(Exception):
@@ -351,40 +394,49 @@ def _parse_range(header: str | None, total: int) -> tuple[int, int]:
     return start, end
 
 
-async def _upstream(audio: dict, start: int, end: int) -> httpx.Response:
-    headers = {**audio["headers"], "Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
-    request = _http.build_request("GET", audio["url"], headers=headers)
+async def _upstream(stream: dict, start: int, end: int) -> httpx.Response:
+    headers = {**stream["headers"], "Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
+    request = _http.build_request("GET", stream["url"], headers=headers)
     return await _http.send(request, stream=True)
 
 
-async def _ensure_size(audio: dict) -> int | None:
+async def _ensure_size(stream: dict) -> int | None:
     """Rozmiar pliku; None oznacza, że link wygasł."""
-    if audio.get("filesize"):
-        return audio["filesize"]
-    resp = await _upstream(audio, 0, 0)
+    if stream.get("filesize"):
+        return stream["filesize"]
+    resp = await _upstream(stream, 0, 0)
     await resp.aclose()
     if resp.status_code in (403, 404, 410):
         return None
     match = re.search(r"/(\d+)$", resp.headers.get("content-range", ""))
     if resp.status_code != 206 or not match:
         raise YouTubeError(f"Nie można ustalić rozmiaru strumienia (HTTP {resp.status_code}).")
-    audio["filesize"] = int(match[1])
-    return audio["filesize"]
+    stream["filesize"] = int(match[1])
+    return stream["filesize"]
 
 
-async def audio_response(video_id: str, range_header: str | None) -> Response:
+async def _get_stream(video_id: str, quality: str, index: int, refresh: bool = False) -> dict:
+    streams = (await get_streams(video_id, quality, refresh))["streams"]
+    if not 0 <= index < len(streams):
+        raise InvalidInput("Nieprawidłowy numer strumienia.")
+    return streams[index]
+
+
+async def stream_response(video_id: str, quality: str, index: int, range_header: str | None) -> Response:
+    """Pojedynczy plik z googlevideo z obsługą Range (audio albo obraz/dźwięk wideo dla ffmpeg)."""
     check_video_id(video_id)
+    check_quality(quality)
     try:
         for attempt in range(2):
-            audio = await get_audio(video_id, refresh=attempt > 0)
-            total = await _ensure_size(audio)
+            stream = await _get_stream(video_id, quality, index, refresh=attempt > 0)
+            total = await _ensure_size(stream)
             if total is None:
                 continue
             try:
                 start, end = _parse_range(range_header, total)
             except _RangeNotSatisfiable:
                 return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
-            first = await _upstream(audio, start, min(end, start + UPSTREAM_CHUNK - 1))
+            first = await _upstream(stream, start, min(end, start + UPSTREAM_CHUNK - 1))
             if first.status_code in (403, 404, 410):
                 await first.aclose()
                 continue
@@ -406,12 +458,13 @@ async def audio_response(video_id: str, range_header: str | None) -> Response:
     if range_header:
         status = 206
         headers["Content-Range"] = f"bytes {start}-{end}/{total}"
-    media_type = MIME_TYPES.get(audio.get("ext") or "", "application/octet-stream")
-    body = _stream_body(video_id, audio, start, end, first)
+    mime_types = AUDIO_MIME if quality == "audio" else VIDEO_MIME
+    media_type = mime_types.get(stream.get("ext") or "", "application/octet-stream")
+    body = _stream_body(video_id, quality, index, stream, start, end, first)
     return StreamingResponse(body, status_code=status, media_type=media_type, headers=headers)
 
 
-async def _stream_body(video_id: str, audio: dict, pos: int, end: int, resp: httpx.Response):
+async def _stream_body(video_id: str, quality: str, index: int, stream: dict, pos: int, end: int, resp: httpx.Response):
     refreshed = False
     try:
         while True:
@@ -428,17 +481,17 @@ async def _stream_body(video_id: str, audio: dict, pos: int, end: int, resp: htt
                 log.warning("pusta odpowiedź googlevideo dla %s na pozycji %d", video_id, pos)
                 return
 
-            resp = await _upstream(audio, pos, min(end, pos + UPSTREAM_CHUNK - 1))
+            resp = await _upstream(stream, pos, min(end, pos + UPSTREAM_CHUNK - 1))
             if resp.status_code in (403, 410) and not refreshed:
                 # Link wygasł w trakcie słuchania: pobieramy nowy, jeśli to ten sam plik.
                 await resp.aclose()
                 refreshed = True
-                fresh = await get_audio(video_id, refresh=True)
-                if fresh.get("filesize") != audio.get("filesize"):
+                fresh = await _get_stream(video_id, quality, index, refresh=True)
+                if fresh.get("filesize") != stream.get("filesize"):
                     log.warning("odświeżony strumień %s ma inny rozmiar, przerywam", video_id)
                     return
-                audio = fresh
-                resp = await _upstream(audio, pos, min(end, pos + UPSTREAM_CHUNK - 1))
+                stream = fresh
+                resp = await _upstream(stream, pos, min(end, pos + UPSTREAM_CHUNK - 1))
             if resp.status_code != 206:
                 log.warning("googlevideo HTTP %d dla %s na pozycji %d", resp.status_code, video_id, pos)
                 return
@@ -446,3 +499,61 @@ async def _stream_body(video_id: str, audio: dict, pos: int, end: int, resp: htt
         log.warning("przerwany strumień %s: %s", video_id, exc)
     finally:
         await resp.aclose()
+
+
+# --- wideo: łączenie obrazu i dźwięku przez ffmpeg ------------------------------
+
+
+async def merged_response(video_id: str, quality: str, start: int) -> StreamingResponse:
+    """Fragmentowany MP4 od sekundy `start`; bez Range, przewijanie = nowe zapytanie z innym `start`."""
+    check_video_id(video_id)
+    if quality not in MERGED:
+        raise InvalidInput("Nieprawidłowa jakość.")
+    if not shutil.which("ffmpeg"):
+        raise YouTubeError("Brak ffmpeg na serwerze, wideo jest niedostępne.")
+    if _ffmpeg_running >= MAX_FFMPEG:
+        raise YouTubeError("Za dużo równoczesnych strumieni wideo. Spróbuj za chwilę.")
+    # Błędy YouTube (film prywatny, anty-bot) zgłaszamy jako JSON, zanim ruszy strumień.
+    data = await get_streams(video_id, quality)
+    if len(data["streams"]) != 2:
+        raise YouTubeError("YouTube nie zwrócił osobnych strumieni obrazu i dźwięku.")
+
+    args = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
+    for index in range(2):
+        if start:
+            args += ["-ss", str(start)]
+        args += ["-rw_timeout", "30000000", "-i", f"{INTERNAL_BASE}/internal/{INTERNAL_SECRET}/{quality}/{index}/{video_id}"]
+    args += [
+        "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        "-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "pipe:1",
+    ]
+    return StreamingResponse(
+        _ffmpeg_body(video_id, args), media_type="video/mp4", headers={"Cache-Control": "private, no-store"}
+    )
+
+
+async def _ffmpeg_body(video_id: str, args: list[str]):
+    global _ffmpeg_running
+    _ffmpeg_running += 1
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stderr = asyncio.ensure_future(proc.stderr.read())
+        while chunk := await proc.stdout.read(READ_SIZE):
+            yield chunk
+        if await proc.wait():
+            message = (await stderr).decode(errors="replace").strip()
+            log.warning("ffmpeg %s zakończył się kodem %d: %s", video_id, proc.returncode, message[-500:])
+    finally:
+        _ffmpeg_running -= 1
+        # Klient się rozłączył (przewinięcie, zmiana filmu): zatrzymujemy ffmpeg.
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+            await proc.wait()

@@ -26,9 +26,34 @@ const els = {
   audio: $("audio"),
   prevBtn: $("prev-btn"),
   nextBtn: $("next-btn"),
+  quality: $("quality"),
+  videoPanel: $("video-panel"),
+  video: $("video"),
+  seekRow: $("seek-row"),
+  seek: $("seek"),
+  seekTime: $("seek-time"),
 };
 
+const QUALITIES = ["audio", "360", "720", "1080"];
+// Wideo serwer łączy przez ffmpeg: strumień bez Range, przewijanie = nowe zapytanie od sekundy t.
+const MERGED = new Set(["360", "720", "1080"]);
+const QUALITY_KEY = "ytp_quality";
+
+function loadQuality() {
+  try {
+    const saved = localStorage.getItem(QUALITY_KEY);
+    if (QUALITIES.includes(saved)) return saved;
+  } catch {
+    // pamięć przeglądarki niedostępna
+  }
+  return "audio";
+}
+
 const state = {
+  quality: loadQuality(),
+  mode: null,      // jakość, w której gra bieżący klip
+  offset: 0,       // sekunda, od której serwer zaczął strumień 720p/1080p
+  seeking: false,  // użytkownik przesuwa suwak pozycji
   list: [],        // aktualnie wyświetlana lista
   queue: [],       // lista, z której gra odtwarzacz (nie zmienia się przy nawigacji)
   queueIndex: -1,
@@ -283,15 +308,55 @@ function playFromList(index) {
   playQueue(index);
 }
 
-function playQueue(index) {
+function currentMedia() {
+  return state.mode === "audio" ? els.audio : els.video;
+}
+
+function stopMedia(media) {
+  media.pause();
+  media.removeAttribute("src");
+  media.load();
+}
+
+function position() {
+  if (!state.mode) return 0;
+  return state.offset + currentMedia().currentTime;
+}
+
+function mediaUrl(item, mode, start) {
+  if (mode === "audio") return `/api/audio/${item.id}`;
+  const url = `/api/video/${item.id}?q=${mode}`;
+  return MERGED.has(mode) && start > 0 ? `${url}&t=${start}` : url;
+}
+
+function playQueue(index, start = 0) {
   const item = state.queue[index];
   if (!item) return;
   state.queueIndex = index;
+  start = Math.max(0, Math.floor(start));
 
-  els.audio.src = `/api/audio/${item.id}`;
-  els.audio.play().catch((err) => {
+  const mode = state.quality;
+  const media = mode === "audio" ? els.audio : els.video;
+  const other = media === els.audio ? els.video : els.audio;
+  if (other.getAttribute("src")) stopMedia(other);
+
+  state.mode = mode;
+  state.offset = MERGED.has(mode) ? start : 0;
+  const url = mediaUrl(item, mode, start);
+  media.src = url;
+  if (!MERGED.has(mode) && start > 0) {
+    // Plik obsługuje Range, więc przewijamy normalnie po wczytaniu metadanych.
+    media.addEventListener("loadedmetadata", () => {
+      if (media.getAttribute("src") === url) media.currentTime = start;
+    }, { once: true });
+  }
+  media.play().catch((err) => {
     if (err.name !== "AbortError") setStatus(`Nie udało się uruchomić odtwarzania: ${err.message}`, true);
   });
+
+  els.videoPanel.hidden = mode === "audio";
+  els.audio.hidden = mode !== "audio";
+  updateSeek();
 
   els.player.hidden = false;
   els.npThumb.src = `/api/thumb/${item.id}`;
@@ -311,12 +376,25 @@ function playQueue(index) {
   markPlaying();
 }
 
-async function explainAudioError() {
+// Suwak pozycji jest potrzebny przy wideo, bo ten strumień nie obsługuje przewijania.
+function updateSeek() {
+  const item = state.queue[state.queueIndex];
+  const show = MERGED.has(state.mode) && Boolean(item && item.duration);
+  els.seekRow.hidden = !show;
+  if (!show || state.seeking) return;
+  const pos = Math.min(Math.floor(position()), item.duration);
+  els.seek.max = item.duration;
+  els.seek.value = pos;
+  els.seekTime.textContent = `${formatDuration(pos)} / ${formatDuration(item.duration)}`;
+}
+
+async function explainMediaError() {
   const item = state.queue[state.queueIndex];
   if (!item) return;
-  // Element <audio> nie pokazuje treści błędu, więc pytamy serwer o szczegóły.
+  // Elementy <audio> i <video> nie pokazują treści błędu, więc pytamy serwer o szczegóły.
+  const url = state.mode === "audio" ? `/api/audio/${item.id}` : `/api/video/${item.id}?q=${state.mode}&check=1`;
   try {
-    const res = await fetch(`/api/audio/${item.id}`, { headers: { Range: "bytes=0-0" }, credentials: "same-origin" });
+    const res = await fetch(url, { headers: { Range: "bytes=0-0" }, credentials: "same-origin" });
     if (res.status === 401) return showLogin();
     if (!res.ok) {
       const data = await res.json().catch(() => null);
@@ -329,9 +407,36 @@ async function explainAudioError() {
   setStatus("Nie udało się odtworzyć tego klipu. Spróbuj ponownie.", true);
 }
 
-els.audio.addEventListener("ended", () => playQueue(state.queueIndex + 1));
-els.audio.addEventListener("error", () => {
-  if (els.audio.getAttribute("src")) explainAudioError();
+for (const media of [els.audio, els.video]) {
+  media.addEventListener("ended", () => playQueue(state.queueIndex + 1));
+  media.addEventListener("error", () => {
+    if (media.getAttribute("src")) explainMediaError();
+  });
+}
+els.video.addEventListener("timeupdate", updateSeek);
+
+els.seek.addEventListener("input", () => {
+  const item = state.queue[state.queueIndex];
+  state.seeking = true;
+  if (item && item.duration) {
+    els.seekTime.textContent = `${formatDuration(Number(els.seek.value))} / ${formatDuration(item.duration)}`;
+  }
+});
+els.seek.addEventListener("change", () => {
+  state.seeking = false;
+  playQueue(state.queueIndex, Number(els.seek.value));
+});
+
+els.quality.value = state.quality;
+els.quality.addEventListener("change", () => {
+  state.quality = els.quality.value;
+  try {
+    localStorage.setItem(QUALITY_KEY, state.quality);
+  } catch {
+    // pamięć przeglądarki niedostępna
+  }
+  // Bieżący klip wznawiamy w nowej jakości od tego samego miejsca.
+  if (state.mode && currentMedia().getAttribute("src")) playQueue(state.queueIndex, position());
 });
 els.prevBtn.addEventListener("click", () => playQueue(state.queueIndex - 1));
 els.nextBtn.addEventListener("click", () => playQueue(state.queueIndex + 1));
@@ -380,9 +485,10 @@ els.moreBtn.addEventListener("click", () => {
 });
 
 els.logoutBtn.addEventListener("click", async () => {
-  els.audio.pause();
-  els.audio.removeAttribute("src");
-  els.audio.load();
+  stopMedia(els.audio);
+  stopMedia(els.video);
+  state.mode = null;
+  els.videoPanel.hidden = true;
   els.player.hidden = true;
   document.title = "YT Audio";
   try {

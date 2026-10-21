@@ -10,6 +10,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DENO_DIR=/tmp/deno \
     DATA_DIR=/data
 
+# ffmpeg łączy osobne strumienie obrazu i dźwięku (wideo 720p/1080p).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin app \
     && mkdir -p /data \
     && chown app:app /data
