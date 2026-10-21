@@ -53,6 +53,7 @@ MERGED = ("360", "720", "1080")
 INTERNAL_BASE = "http://127.0.0.1:8000"
 INTERNAL_SECRET = secrets.token_urlsafe(24)
 MAX_FFMPEG = 3
+RW_TIMEOUT = "30000000"  # mikrosekundy
 
 
 class YouTubeError(Exception):
@@ -518,20 +519,52 @@ async def merged_response(video_id: str, quality: str, start: int) -> StreamingR
     if len(data["streams"]) != 2:
         raise YouTubeError("YouTube nie zwrócił osobnych strumieni obrazu i dźwięku.")
 
+    video_url, audio_url = (f"{INTERNAL_BASE}/internal/{INTERNAL_SECRET}/{quality}/{i}/{video_id}" for i in range(2))
     args = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
-    for index in range(2):
-        if start:
-            args += ["-ss", str(start)]
-        args += ["-rw_timeout", "30000000", "-i", f"{INTERNAL_BASE}/internal/{INTERNAL_SECRET}/{quality}/{index}/{video_id}"]
+    if start:
+        # Obraz (bez przekodowania) może zacząć się tylko od klatki kluczowej, zwykle kilka
+        # sekund przed `start`. Fragmentowany MP4 zeruje czas każdej ścieżki osobno, więc
+        # dźwięk musi zacząć się dokładnie tam, gdzie obraz, inaczej się rozjadą.
+        audio_start = await _keyframe_dts(video_url, start)
+        if audio_start is None:
+            log.warning("nie ustalono klatki kluczowej dla %s od %d s, możliwy rozjazd", video_id, start)
+            audio_start = str(start)
+        args += ["-copyts", "-ss", str(start), "-rw_timeout", RW_TIMEOUT, "-i", video_url]
+        args += ["-ss", audio_start, "-rw_timeout", RW_TIMEOUT, "-i", audio_url]
+        args += ["-avoid_negative_ts", "disabled"]
+    else:
+        args += ["-rw_timeout", RW_TIMEOUT, "-i", video_url, "-rw_timeout", RW_TIMEOUT, "-i", audio_url]
     args += [
-        "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
-        "-avoid_negative_ts", "make_zero",
+        # Dźwięk kodujemy na nowo, bo tylko wtedy ffmpeg przewija go z dokładnością do ramki.
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
         "-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof",
         "pipe:1",
     ]
     return StreamingResponse(
         _ffmpeg_body(video_id, args), media_type="video/mp4", headers={"Cache-Control": "private, no-store"}
     )
+
+
+async def _keyframe_dts(video_url: str, start: int) -> str | None:
+    """Czas (DTS) klatki kluczowej, od której ffmpeg zacznie obraz przy `-ss start`."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-rw_timeout", RW_TIMEOUT,
+        "-select_streams", "v:0", "-read_intervals", f"{start}%+#1",
+        "-show_entries", "packet=dts_time", "-of", "csv=p=0", video_url,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), 30)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return None
+    values = out.decode().split()
+    if values and re.fullmatch(r"\d+(\.\d+)?", values[0]):
+        return values[0]
+    return None
 
 
 async def _ffmpeg_body(video_id: str, args: list[str]):
