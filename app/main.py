@@ -1,9 +1,11 @@
 """YT Audio: prywatna przejściówka do słuchania YouTube przez własny serwer."""
 
 import logging
+import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
@@ -165,7 +167,30 @@ async def remove_favorite(channel_id: str, request: Request):
 
 @app.get("/api/audio/{video_id}", dependencies=[Depends(require_user)])
 async def audio(video_id: str, request: Request):
-    return await youtube.audio_response(video_id, request.headers.get("range"))
+    return await youtube.stream_response(video_id, "audio", 0, request.headers.get("range"))
+
+
+@app.get("/api/video/{video_id}", dependencies=[Depends(require_user)])
+async def video(
+    video_id: str,
+    q: Literal["360", "720", "1080"] = "360",
+    t: int = Query(0, ge=0, le=86400),
+    check: bool = False,
+):
+    if check:
+        # Sprawdzenie dostępności bez uruchamiania strumienia (komunikat błędu dla odtwarzacza).
+        await youtube.get_streams(video_id, q)
+        return {"ok": True}
+    return await youtube.merged_response(video_id, q, t)
+
+
+@app.get("/internal/{secret}/{quality}/{index}/{video_id}")
+async def internal_stream(secret: str, quality: str, index: int, video_id: str, request: Request):
+    """Źródło dla ffmpeg; dostępne tylko z wnętrza kontenera (Caddy łączy się z innego adresu)."""
+    peer = request.client.host if request.client else ""
+    if peer not in ("127.0.0.1", "::1") or not secrets.compare_digest(secret, youtube.INTERNAL_SECRET):
+        raise HTTPException(status_code=404)
+    return await youtube.stream_response(video_id, quality, index, request.headers.get("range"))
 
 
 @app.get("/api/thumb/{video_id}", dependencies=[Depends(require_user)])

@@ -1,6 +1,8 @@
 # YT Audio
 
-Prywatna przejściówka do słuchania YouTube przez własny serwer. Wyszukiwanie, przeglądanie kanałów i odtwarzanie samego dźwięku w przeglądarce. Cały ruch (lista, miniatury, audio) idzie przez Twoją domenę, więc przeglądarka nie łączy się z żadnym serwerem Google.
+Prywatna przejściówka do słuchania i oglądania YouTube przez własny serwer. Wyszukiwanie, przeglądanie kanałów i odtwarzanie w przeglądarce: samego dźwięku albo wideo w 360p, 720p lub 1080p (wybór w górnym pasku). Cały ruch (lista, miniatury, audio, wideo) idzie przez Twoją domenę, więc przeglądarka nie łączy się z żadnym serwerem Google.
+
+YouTube podaje obraz i dźwięk jako osobne strumienie, więc przy wideo serwer łączy je w locie przez ffmpeg (bez przekodowania, niskie użycie CPU). Taki strumień nie obsługuje przewijania w samym odtwarzaczu, dlatego pod wideo jest osobny suwak pozycji: przesunięcie go uruchamia strumień od nowa od wybranej sekundy (start od najbliższej wcześniejszej klatki kluczowej, czyli zwykle kilka sekund wcześniej).
 
 ```
 Internet ──TCP 443/80──> [Caddy] ──sieć wewnętrzna──> [app: FastAPI + yt-dlp]
@@ -130,4 +132,17 @@ Nieudane logowania mają postać `login_failed ip=...`, a blokady `login_locked 
 - **„YouTube zablokował zapytanie (weryfikacja anty-bot)”**: YouTube uznał zapytania za automatyczne. Zwykle mija samo; pomaga też aktualizacja yt-dlp.
 - **Caddy nie dostaje certyfikatu**: sprawdź, czy DNS wskazuje na Twoje IP i czy router przekierowuje port 80.
 - **Kolizja podsieci Dockera** (`Pool overlaps with other one`): zmień `172.31.250.0/24` w `docker-compose.yml` i tak samo `TRUSTED_PROXY_NETS` w `.env`.
+- **Wideo nie działa w Safari (iPhone, iPad, Mac)**: Safari wymaga, żeby serwer obsługiwał zapytania o fragmenty pliku (Range), a łączony w locie strumień wideo tego nie umożliwia. Tryb „Audio” działa normalnie.
+- **„Za dużo równoczesnych strumieni wideo”**: jednocześnie działają najwyżej 3 procesy ffmpeg (`MAX_FFMPEG` w `app/youtube.py`).
 - **Ekran logowania po każdym odświeżeniu**: strona musi być otwierana przez `https://`, bo ciasteczko sesji ma flagę `Secure`.
+- **Kontener nie rozwiązuje nazw YouTube** (błędy połączenia, `Temporary failure in name resolution`): zwykle winny jest resolver hosta (np. `systemd-resolved` na `127.0.0.53`) albo Pi-hole/AdGuard blokujący `googlevideo.com`. Utwórz obok `docker-compose.yml` plik `docker-compose.override.yml` (Compose wczyta go automatycznie, a Git go ignoruje):
+
+  ```yaml
+  services:
+    app:
+      dns:
+        - 1.1.1.1
+        - 8.8.8.8
+  ```
+
+  Potem `docker compose up -d app`. Nazwy wewnętrzne (np. `app` dla Caddy) nadal działają przez DNS Dockera.
