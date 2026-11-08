@@ -407,8 +407,53 @@ async function explainMediaError() {
   setStatus("Nie udało się odtworzyć tego klipu. Spróbuj ponownie.", true);
 }
 
+// Strażnik wideo: strumień łączony przez ffmpeg nie ma Range, więc przeglądarka sama
+// nie wznowi go po zacięciu. Robimy to my, od bieżącej pozycji.
+const STALL_MS = 15000;     // tyle czekamy na dane, zanim uruchomimy strumień od nowa
+const EARLY_END_S = 10;     // koniec strumienia wcześniej niż tyle sekund przed końcem filmu = urwany
+const MAX_RESUMES = 3;      // najwyżej tyle wznowień w ciągu RESUME_WINDOW_MS
+const RESUME_WINDOW_MS = 120000;
+let stallTimer = null;
+let resumeTimes = [];
+
+function clearStall() {
+  clearTimeout(stallTimer);
+  stallTimer = null;
+}
+
+function resumeVideo() {
+  clearStall();
+  if (!MERGED.has(state.mode) || !els.video.getAttribute("src")) return;
+  const now = Date.now();
+  resumeTimes = resumeTimes.filter((t) => now - t < RESUME_WINDOW_MS);
+  if (resumeTimes.length >= MAX_RESUMES) {
+    setStatus("Strumień wideo ciągle się zacina. Spróbuj niższej jakości albo trybu Audio.", true);
+    return;
+  }
+  resumeTimes.push(now);
+  playQueue(state.queueIndex, Math.max(0, position() - 1));
+}
+
+els.video.addEventListener("waiting", () => {
+  if (!MERGED.has(state.mode) || stallTimer) return;
+  stallTimer = setTimeout(() => {
+    stallTimer = null;
+    // HAVE_FUTURE_DATA (3): dane jednak doszły, nic nie robimy.
+    if (els.video.readyState < 3 && !els.video.paused) resumeVideo();
+  }, STALL_MS);
+});
+for (const event of ["playing", "pause", "emptied"]) els.video.addEventListener(event, clearStall);
+
+function streamCutShort() {
+  const item = state.queue[state.queueIndex];
+  return MERGED.has(state.mode) && item && item.duration && position() < item.duration - EARLY_END_S;
+}
+
 for (const media of [els.audio, els.video]) {
-  media.addEventListener("ended", () => playQueue(state.queueIndex + 1));
+  media.addEventListener("ended", () => {
+    if (media === els.video && streamCutShort()) return resumeVideo();
+    playQueue(state.queueIndex + 1);
+  });
   media.addEventListener("error", () => {
     if (media.getAttribute("src")) explainMediaError();
   });
