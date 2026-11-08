@@ -42,6 +42,13 @@
           <input type="range" id="seek" min="0" max="0" step="1" value="0" aria-label="Pozycja w filmie">
           <span id="seek-time" class="seek-time"></span>
         </div>
+        <div class="source">
+          <div id="source-title" class="source-title"></div>
+          <div class="source-row">
+            <input type="text" id="source-url" class="source-url" readonly aria-label="Adres filmu na YouTube">
+            <button type="button" id="copy-btn" class="ghost">Kopiuj</button>
+          </div>
+        </div>
       </section>
 
       <section id="favorites" class="favorites" hidden>

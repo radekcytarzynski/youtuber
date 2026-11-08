@@ -32,6 +32,9 @@ const els = {
   seekRow: $("seek-row"),
   seek: $("seek"),
   seekTime: $("seek-time"),
+  sourceTitle: $("source-title"),
+  sourceUrl: $("source-url"),
+  copyBtn: $("copy-btn"),
 };
 
 const QUALITIES = ["audio", "360", "720", "1080"];
@@ -362,6 +365,10 @@ function playQueue(index, start = 0) {
   els.npThumb.src = `/api/thumb/${item.id}`;
   els.npTitle.textContent = item.title;
   els.npChannel.textContent = item.channel || "";
+  // Oryginalny adres tylko jako tekst do skopiowania (bez linku, żeby nic nie łączyło się z YouTube).
+  els.sourceTitle.textContent = item.title;
+  els.sourceUrl.value = `https://www.youtube.com/watch?v=${item.id}`;
+  els.copyBtn.textContent = "Kopiuj";
   els.prevBtn.disabled = index <= 0;
   els.nextBtn.disabled = index >= state.queue.length - 1;
   document.title = `${item.title} · YT Audio`;
@@ -470,6 +477,25 @@ els.seek.addEventListener("input", () => {
 els.seek.addEventListener("change", () => {
   state.seeking = false;
   playQueue(state.queueIndex, Number(els.seek.value));
+});
+
+els.sourceUrl.addEventListener("focus", () => els.sourceUrl.select());
+els.copyBtn.addEventListener("click", async () => {
+  const url = els.sourceUrl.value;
+  if (!url) return;
+  let copied = false;
+  try {
+    await navigator.clipboard.writeText(url);
+    copied = true;
+  } catch {
+    // Starsze przeglądarki: kopiowanie przez zaznaczenie pola.
+    els.sourceUrl.select();
+    copied = document.execCommand("copy");
+  }
+  els.copyBtn.textContent = copied ? "Skopiowano" : "Zaznaczono, skopiuj ręcznie";
+  setTimeout(() => {
+    if (els.sourceUrl.value === url) els.copyBtn.textContent = "Kopiuj";
+  }, 2000);
 });
 
 els.quality.value = state.quality;
