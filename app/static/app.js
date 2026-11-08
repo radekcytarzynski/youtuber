@@ -32,6 +32,10 @@ const els = {
   seekRow: $("seek-row"),
   seek: $("seek"),
   seekTime: $("seek-time"),
+  source: $("source"),
+  sourceTitle: $("source-title"),
+  sourceUrl: $("source-url"),
+  copyBtn: $("copy-btn"),
 };
 
 const QUALITIES = ["audio", "360", "720", "1080"];
@@ -362,6 +366,11 @@ function playQueue(index, start = 0) {
   els.npThumb.src = `/api/thumb/${item.id}`;
   els.npTitle.textContent = item.title;
   els.npChannel.textContent = item.channel || "";
+  // Oryginalny adres tylko jako tekst do skopiowania (bez linku, żeby nic nie łączyło się z YouTube).
+  els.sourceTitle.textContent = item.title;
+  els.sourceUrl.value = `https://www.youtube.com/watch?v=${item.id}`;
+  els.copyBtn.textContent = "Kopiuj";
+  els.source.hidden = false;
   els.prevBtn.disabled = index <= 0;
   els.nextBtn.disabled = index >= state.queue.length - 1;
   document.title = `${item.title} · YT Audio`;
@@ -407,8 +416,53 @@ async function explainMediaError() {
   setStatus("Nie udało się odtworzyć tego klipu. Spróbuj ponownie.", true);
 }
 
+// Strażnik wideo: strumień łączony przez ffmpeg nie ma Range, więc przeglądarka sama
+// nie wznowi go po zacięciu. Robimy to my, od bieżącej pozycji.
+const STALL_MS = 15000;     // tyle czekamy na dane, zanim uruchomimy strumień od nowa
+const EARLY_END_S = 10;     // koniec strumienia wcześniej niż tyle sekund przed końcem filmu = urwany
+const MAX_RESUMES = 3;      // najwyżej tyle wznowień w ciągu RESUME_WINDOW_MS
+const RESUME_WINDOW_MS = 120000;
+let stallTimer = null;
+let resumeTimes = [];
+
+function clearStall() {
+  clearTimeout(stallTimer);
+  stallTimer = null;
+}
+
+function resumeVideo() {
+  clearStall();
+  if (!MERGED.has(state.mode) || !els.video.getAttribute("src")) return;
+  const now = Date.now();
+  resumeTimes = resumeTimes.filter((t) => now - t < RESUME_WINDOW_MS);
+  if (resumeTimes.length >= MAX_RESUMES) {
+    setStatus("Strumień wideo ciągle się zacina. Spróbuj niższej jakości albo trybu Audio.", true);
+    return;
+  }
+  resumeTimes.push(now);
+  playQueue(state.queueIndex, Math.max(0, position() - 1));
+}
+
+els.video.addEventListener("waiting", () => {
+  if (!MERGED.has(state.mode) || stallTimer) return;
+  stallTimer = setTimeout(() => {
+    stallTimer = null;
+    // HAVE_FUTURE_DATA (3): dane jednak doszły, nic nie robimy.
+    if (els.video.readyState < 3 && !els.video.paused) resumeVideo();
+  }, STALL_MS);
+});
+for (const event of ["playing", "pause", "emptied"]) els.video.addEventListener(event, clearStall);
+
+function streamCutShort() {
+  const item = state.queue[state.queueIndex];
+  return MERGED.has(state.mode) && item && item.duration && position() < item.duration - EARLY_END_S;
+}
+
 for (const media of [els.audio, els.video]) {
-  media.addEventListener("ended", () => playQueue(state.queueIndex + 1));
+  media.addEventListener("ended", () => {
+    if (media === els.video && streamCutShort()) return resumeVideo();
+    playQueue(state.queueIndex + 1);
+  });
   media.addEventListener("error", () => {
     if (media.getAttribute("src")) explainMediaError();
   });
@@ -425,6 +479,25 @@ els.seek.addEventListener("input", () => {
 els.seek.addEventListener("change", () => {
   state.seeking = false;
   playQueue(state.queueIndex, Number(els.seek.value));
+});
+
+els.sourceUrl.addEventListener("focus", () => els.sourceUrl.select());
+els.copyBtn.addEventListener("click", async () => {
+  const url = els.sourceUrl.value;
+  if (!url) return;
+  let copied = false;
+  try {
+    await navigator.clipboard.writeText(url);
+    copied = true;
+  } catch {
+    // Starsze przeglądarki: kopiowanie przez zaznaczenie pola.
+    els.sourceUrl.select();
+    copied = document.execCommand("copy");
+  }
+  els.copyBtn.textContent = copied ? "Skopiowano" : "Zaznaczono, skopiuj ręcznie";
+  setTimeout(() => {
+    if (els.sourceUrl.value === url) els.copyBtn.textContent = "Kopiuj";
+  }, 2000);
 });
 
 els.quality.value = state.quality;
@@ -489,6 +562,7 @@ els.logoutBtn.addEventListener("click", async () => {
   stopMedia(els.video);
   state.mode = null;
   els.videoPanel.hidden = true;
+  els.source.hidden = true;
   els.player.hidden = true;
   document.title = "YT Audio";
   try {

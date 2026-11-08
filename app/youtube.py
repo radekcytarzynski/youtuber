@@ -23,6 +23,9 @@ WATCH_URL = "https://www.youtube.com/watch?v="
 # zapytanie o cały plik YouTube potrafi mocno spowalniać.
 UPSTREAM_CHUNK = 10 * 1024 * 1024
 READ_SIZE = 64 * 1024
+# Ile danych pobieramy z wyprzedzeniem na strumień. Dzięki temu kolejny kawałek
+# z googlevideo jest zamawiany, zanim klient (przeglądarka albo ffmpeg) skończy bieżący.
+PREFETCH_BYTES = 8 * 1024 * 1024
 THUMB_KEEP = 5000
 
 AUDIO_MIME = {"m4a": "audio/mp4", "mp4": "audio/mp4", "webm": "audio/webm", "opus": "audio/ogg"}
@@ -466,6 +469,32 @@ async def stream_response(video_id: str, quality: str, index: int, range_header:
 
 
 async def _stream_body(video_id: str, quality: str, index: int, stream: dict, pos: int, end: int, resp: httpx.Response):
+    """Oddaje dane klientowi, a pobieranie z googlevideo idzie w tle z wyprzedzeniem."""
+    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=max(1, PREFETCH_BYTES // READ_SIZE))
+    producer = asyncio.create_task(_download(video_id, quality, index, stream, pos, end, resp, queue))
+    try:
+        while (chunk := await queue.get()) is not None:
+            yield chunk
+    finally:
+        # Klient się rozłączył albo strumień się skończył: zatrzymujemy pobieranie.
+        producer.cancel()
+
+
+async def _download(
+    video_id: str, quality: str, index: int, stream: dict, pos: int, end: int, resp: httpx.Response, queue: asyncio.Queue
+) -> None:
+    """Pobiera kolejne kawałki do kolejki; na końcu (także po błędzie) wstawia None."""
+    try:
+        await _download_chunks(video_id, quality, index, stream, pos, end, resp, queue)
+    except Exception:
+        log.exception("nieoczekiwany błąd pobierania %s", video_id)
+    # Przy anulowaniu (klient zniknął) nie dochodzimy tutaj i nikt już nie czyta kolejki.
+    await queue.put(None)
+
+
+async def _download_chunks(
+    video_id: str, quality: str, index: int, stream: dict, pos: int, end: int, resp: httpx.Response, queue: asyncio.Queue
+) -> None:
     refreshed = False
     try:
         while True:
@@ -474,7 +503,7 @@ async def _stream_body(video_id: str, quality: str, index: int, stream: dict, po
                 chunk = chunk[: end - pos + 1]
                 pos += len(chunk)
                 received += len(chunk)
-                yield chunk
+                await queue.put(chunk)
                 if pos > end:
                     return
             await resp.aclose()
@@ -540,6 +569,10 @@ async def merged_response(video_id: str, quality: str, start: int) -> StreamingR
         "-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof",
         "pipe:1",
     ]
+    # Ponowne sprawdzenie: wywołania wyżej (yt-dlp, ffprobe) mogą trwać kilka sekund,
+    # a w tym czasie inne zapytania mogły już uruchomić swoje ffmpeg.
+    if _ffmpeg_running >= MAX_FFMPEG:
+        raise YouTubeError("Za dużo równoczesnych strumieni wideo. Spróbuj za chwilę.")
     return StreamingResponse(
         _ffmpeg_body(video_id, args), media_type="video/mp4", headers={"Cache-Control": "private, no-store"}
     )

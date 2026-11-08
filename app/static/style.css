@@ -263,7 +263,7 @@ input:focus-visible, button:focus-visible, a:focus-visible, select:focus-visible
 
 /* --- wideo --- */
 
-.video-panel { margin: 0 auto 20px; max-width: 1100px; }
+.video-panel { margin: 0 auto 12px; max-width: 1100px; }
 
 .video-panel video {
   display: block;
@@ -277,6 +277,21 @@ input:focus-visible, button:focus-visible, a:focus-visible, select:focus-visible
 .seek-row { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
 .seek-row input { flex: 1; padding: 0; border: 0; background: none; accent-color: var(--accent); }
 .seek-time { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+.source { margin: 0 auto 20px; max-width: 1100px; }
+.source-title { font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
+.source-row { display: flex; gap: 8px; margin-top: 6px; }
+.source-url {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 13px;
+}
+.source-row button { flex: none; }
 
 /* --- odtwarzacz --- */
 
