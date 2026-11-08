@@ -32,6 +32,7 @@ const els = {
   seekRow: $("seek-row"),
   seek: $("seek"),
   seekTime: $("seek-time"),
+  source: $("source"),
   sourceTitle: $("source-title"),
   sourceUrl: $("source-url"),
   copyBtn: $("copy-btn"),
@@ -369,6 +370,7 @@ function playQueue(index, start = 0) {
   els.sourceTitle.textContent = item.title;
   els.sourceUrl.value = `https://www.youtube.com/watch?v=${item.id}`;
   els.copyBtn.textContent = "Kopiuj";
+  els.source.hidden = false;
   els.prevBtn.disabled = index <= 0;
   els.nextBtn.disabled = index >= state.queue.length - 1;
   document.title = `${item.title} · YT Audio`;
@@ -560,6 +562,7 @@ els.logoutBtn.addEventListener("click", async () => {
   stopMedia(els.video);
   state.mode = null;
   els.videoPanel.hidden = true;
+  els.source.hidden = true;
   els.player.hidden = true;
   document.title = "YT Audio";
   try {
